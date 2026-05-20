@@ -3,15 +3,23 @@
 # SPDX-License-Identifier: MIT
 """
 Atlantis -> Microsoft Teams Relay
-Receives Slack-format webhooks from Atlantis and forwards them
+Accepts webhook payloads from Atlantis (the native "kind: http" payload
+with PascalCase Repo/Pull/Project/Success fields) and forwards them
 to a Microsoft Teams Workflows webhook as Adaptive Cards.
+
+For convenience the relay also accepts the classic Slack incoming-webhook
+shape ({text, attachments[]}) — useful for ad-hoc curl tests or other
+senders. The payload type is auto-detected.
 
 Usage:
     pip install flask requests
-    TEAMS_WEBHOOK_URL=https://your-url python atlantis_teams_relay.py
+    TEAMS_WEBHOOK_URL=https://your-url python relay.py
 
-Atlantis config:
-    Set your webhook URL to http://this-server:5025/relay
+Atlantis config (server-side YAML or env):
+    webhooks:
+      - event: apply
+        kind: http
+        url: http://this-server:5025/relay
 """
 
 import os
@@ -107,13 +115,87 @@ def build_adaptive_card(atlantis_payload: dict) -> dict:
     }
 
 
+def is_atlantis_native(payload: dict) -> bool:
+    """Heuristic: Atlantis's kind:http body uses PascalCase top-level fields."""
+    if not isinstance(payload, dict):
+        return False
+    return "Repo" in payload or "Pull" in payload or "Success" in payload
+
+
+def build_card_from_atlantis(payload: dict) -> dict:
+    """Convert Atlantis's native HTTP-webhook payload into a Teams Adaptive Card."""
+    success = bool(payload.get("Success", False))
+    repo = payload.get("Repo") or {}
+    pull = payload.get("Pull") or {}
+    user = payload.get("User") or {}
+
+    repo_full = repo.get("FullName") or "/".join(
+        p for p in (repo.get("Owner"), repo.get("Name")) if p
+    )
+    pull_num = pull.get("Num")
+    pull_url = pull.get("URL", "")
+    pull_author = pull.get("Author", "")
+    username = user.get("Username", "")
+    project = payload.get("Project", "")
+    workspace = payload.get("Workspace", "")
+    directory = payload.get("Directory", "")
+
+    title = "Atlantis apply succeeded" if success else "Atlantis apply failed"
+    color = "Good" if success else "Attention"
+
+    facts = []
+    if repo_full:
+        facts.append({"title": "Repo", "value": repo_full})
+    if pull_num is not None:
+        pull_value = f"[#{pull_num}]({pull_url})" if pull_url else f"#{pull_num}"
+        if pull_author:
+            pull_value += f" by {pull_author}"
+        facts.append({"title": "Pull request", "value": pull_value})
+    if project:
+        facts.append({"title": "Project", "value": project})
+    if workspace:
+        facts.append({"title": "Workspace", "value": workspace})
+    if directory:
+        facts.append({"title": "Directory", "value": directory})
+    if username:
+        facts.append({"title": "Triggered by", "value": username})
+
+    body = [{
+        "type": "TextBlock",
+        "text": title,
+        "wrap": True,
+        "size": "Medium",
+        "weight": "Bolder",
+        "color": color,
+    }]
+    if facts:
+        body.append({"type": "FactSet", "facts": facts})
+
+    return {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.2",
+                "body": body,
+            },
+        }],
+    }
+
+
 @app.route("/relay", methods=["POST"])
 def relay():
     try:
         payload = request.get_json(force=True)
         logger.info("Received payload: %s", json.dumps(payload))
 
-        card = build_adaptive_card(payload)
+        card = (
+            build_card_from_atlantis(payload)
+            if is_atlantis_native(payload)
+            else build_adaptive_card(payload)
+        )
         logger.info("Sending card: %s", json.dumps(card))
 
         resp = requests.post(TEAMS_WEBHOOK_URL, json=card, timeout=10)
