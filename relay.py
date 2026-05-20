@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Quantifi Solutions Inc
+# SPDX-License-Identifier: MIT
 """
 Atlantis -> Microsoft Teams Relay
 Receives Slack-format webhooks from Atlantis and forwards them
